@@ -1,0 +1,9 @@
+pygame>=2.5
+numpy>=1.26
+pillow>=10.0
+scipy>=1.11
+panda3d>=1.10.14
+panda3d-gltf>=1.2
+panda3d-simplepbr>=0.12
+opencv-python>=4.8
+trimesh>=4.0

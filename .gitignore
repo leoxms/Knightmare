@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.log
+captura_*.png
+capturas/
+capturas3d/
+
+# imagens brutas da IA (grandes; as versoes processadas ficam em arte/)
+arte/bruto/
+
+# animacoes/modelos do Mixamo: nao redistribuir (baixe em https://www.mixamo.com)
+mixamo/baixados/*
+!mixamo/baixados/.gitkeep
+mixamo/enviar/
+
+# musicas sao do usuario
+musica/*
+!musica/.gitkeep
