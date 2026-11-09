@@ -27,6 +27,7 @@ framebuffer-multisample true
 multisamples 4
 audio-library-name null
 textures-power-2 none
+hardware-animated-vertices true
 """
 if TEST:
     cfg += "window-type offscreen\n"
@@ -45,8 +46,27 @@ import simplepbr                                       # noqa: E402
 ROAD_W = 3.2
 WALK_LIM = ROAD_W + 0.8
 SPEED = float(os.environ.get("LAMINA_VELOCIDADE", "0.7")) * 4.2
+HERO_SPEED = float(os.environ.get("LAMINA_VELOCIDADE_HEROI", "1.7"))   # m/s com a animacao Unarmed Walk
+# posicao/rotacao da espada na mao direita (metros e graus, no espaco do osso RightHand)
+SWORD_GRIP = (0.0, 0.07, 0.0, 0, 0, 0)
+# ataques: animacao -> (momentos do impacto em fracao da duracao, alcance em m, dano)
+ATAQUES = {"soco": ((0.19, 0.31), 1.5, 1), "espada": ((0.53,), 2.4, 4)}
+# por do sol: sol baixo a frente-direita (contraluz dourado), ambiente violeta, nevoa quente
+CEU = dict(amb=(0.26, 0.22, 0.30), sol=(2.9, 1.75, 0.95), sol_hpr=(200, -16, 0),
+           nevoa=(0.72, 0.50, 0.38), ceu_tom=(1.75, 1.45, 1.35))
+# ciclo do dia: comeca com sol a pino e escurece ate a noite em CICLO segundos
+CICLO = float(os.environ.get("LAMINA_CICLO", "300"))
+# (fracao do ciclo, ambiente, sol, (h, p) do sol, nevoa, mistura ceu dia->por do sol, tom do ceu)
+DIA = [
+    (0.00, (0.40, 0.42, 0.46), (2.7, 2.6, 2.4), (30, -62), (0.72, 0.80, 0.90), 0.0, (1.25, 1.25, 1.25)),
+    (0.35, (0.38, 0.38, 0.40), (2.8, 2.5, 2.1), (110, -42), (0.74, 0.76, 0.80), 0.0, (1.20, 1.15, 1.10)),
+    (0.60, (0.32, 0.27, 0.30), (2.9, 2.0, 1.3), (170, -25), (0.74, 0.62, 0.52), 0.6, (1.5, 1.3, 1.2)),
+    (0.78, CEU["amb"], CEU["sol"], CEU["sol_hpr"][:2], CEU["nevoa"], 1.0, CEU["ceu_tom"]),
+    (1.00, (0.07, 0.07, 0.14), (0.30, 0.20, 0.24), (205, -6), (0.035, 0.035, 0.07), 1.0, (0.16, 0.13, 0.26)),
+]
 STRAFE = 4.0
 CAM_BACK, CAM_UP = 6.5, 3.4
+CAM_ALVO_Z = 1.5          # altura do ponto que a camera olha (mais alto = mais ceu)
 VIEW = 140.0
 
 
@@ -261,14 +281,17 @@ class Jogo(ShowBase):
         ShowBase.__init__(self)
         self.disableMouse()
         self.pipeline = simplepbr.init(enable_shadows=True, enable_fog=True, msaa_samples=0 if TEST else 4,
-                                       exposure=-0.6, max_lights=4)
+                                       exposure=-0.6, max_lights=4,
+                                       use_330=True, use_hardware_skinning=True)   # deforma na GPU
         self.camLens.setFov(58)
         self.camLens.setNearFar(0.3, 400)
-        self.setBackgroundColor(0.44, 0.47, 0.52, 1)
+        self.setBackgroundColor(*CEU["nevoa"], 1)
         self.keys = {}
         for k in ("a", "d", "w", "s", "arrow_left", "arrow_right", "arrow_up", "arrow_down", "space", "mouse1"):
             self.accept(k, self.keys.__setitem__, [k, True])
             self.accept(k + "-up", self.keys.__setitem__, [k, False])
+        self.accept("q", self.toggle_sword)
+        self.accept("tab", self.toggle_sword)
         self.accept("escape", sys.exit)
         self.px, self.py, self.pvx = 0.0, 0.0, 0.0
         self.walk = 0.0
@@ -287,11 +310,22 @@ class Jogo(ShowBase):
         self.has_golpe = os.path.exists(self.golpe_path)
         self.next_golpe_y = 18.0
         # figura do Mixamo convertida para GLB (o leitor de FBX do Panda3D quebra a deformacao do corpo)
-        fig = os.environ.get("LAMINA_FIGURA") or os.path.join(AQUI, "mixamo", "baixados", "andar.glb")
+        bx = os.path.join(AQUI, "mixamo", "baixados")
+        fig = os.environ.get("LAMINA_FIGURA") or os.path.join(bx, "heroi_andar.glb")
+        if not os.path.exists(fig):
+            fig = os.path.join(bx, "andar.glb")
+        self.armed = False          # comeca sem arma; a espada aparece na estrada
+        self.has_sword = False
+        self.atk = None
+        self.sword_item = None
+        self.next_sword_y = 22.0
         if os.path.exists(fig) and os.environ.get("LAMINA_FIGURA", "1") != "0":
             self.build_figure(fig)
         else:
             self.build_knight()
+        if TEST and os.environ.get("LAMINA_TESTE_ESPADA") and hasattr(self, "hero_anims"):
+            self.has_sword = True
+            self.toggle_sword()
         self.scenery = {}
         self.hud = OnscreenText(text="", pos=(-1.72, 0.92), scale=0.06, fg=(1, 0.95, 0.8, 1),
                                 shadow=(0, 0, 0, 0.8), align=TextNode.ALeft, mayChange=True)
@@ -317,7 +351,10 @@ class Jogo(ShowBase):
         self.t_grass = self.tex(os.path.join(ARTE, "grama.png"))
         self.t_marble = self.tex(build_marble_texture())
         self.t_glow = self.tex(build_glow_texture(), False)
-        self.t_sky = self.tex(os.path.join(ARTE, "ceu.png"), False)
+        ceu = os.path.join(ARTE, "ceu_por_do_sol.png")
+        self.t_sky = self.tex(ceu if os.path.exists(ceu) else os.path.join(ARTE, "ceu.png"), False)
+        dia = os.path.join(ARTE, "ceu_dia.png")
+        self.t_sky_dia = self.tex(dia, False) if os.path.exists(dia) else None
         self.sprites = {}
         for name in ("carvalho", "cipreste", "morcego", "gosma", "cristal", "chefe"):
             self.sprites[name] = self.tex(os.path.join(ARTE, name + ".png"), False)
@@ -325,25 +362,28 @@ class Jogo(ShowBase):
 
     def build_lights(self):
         amb = AmbientLight("amb")
-        amb.setColor(Vec4(0.30, 0.32, 0.36, 1))
+        amb.setColor(Vec4(*CEU["amb"], 1))
+        self.amb = amb
         self.render.setLight(self.render.attachNewNode(amb))
         sun = DirectionalLight("sol")
-        sun.setColor(Vec4(2.5, 2.35, 2.15, 1))
+        sun.setColor(Vec4(*CEU["sol"], 1))
         sun.setShadowCaster(True, 2048, 2048)
         lens = sun.getLens()
         lens.setFilmSize(36, 36)
         lens.setNearFar(1, 80)
+        self.sun_light = sun
         self.sun = self.render.attachNewNode(sun)
-        self.sun.setHpr(35, -55, 0)
+        self.sun.setHpr(*CEU["sol_hpr"])
         self.render.setLight(self.sun)
         fog = Fog("nevoa")
-        fog.setColor(0.44, 0.47, 0.52)
-        fog.setExpDensity(0.0042)
+        fog.setColor(*CEU["nevoa"])
+        fog.setExpDensity(0.0030)
+        self.fog = fog
         self.render.setFog(fog)
 
     def build_sky(self):
         cm = CardMaker("ceu")
-        cm.setFrame(-420, 420, -60, 300)
+        cm.setFrame(-250, 250, 45, 185)        # faixa colorida das nuvens logo acima do horizonte
         sky = self.camera.attachNewNode(cm.generate())
         sky.setPos(0, 380, 0)
         sky.setTexture(self.t_sky)
@@ -353,8 +393,46 @@ class Jogo(ShowBase):
         sky.setFogOff(1)
         sky.setShaderOff(1)
         sky.setP(14)
-        sky.setColorScale(0.78, 0.80, 0.86, 1)
+        sky.setColorScale(*CEU["ceu_tom"], 1)
         self.sky = sky
+        self.sky_dia = None
+        if self.t_sky_dia is not None:
+            # ceu de dia por baixo; o do por do sol aparece por cima conforme o tempo passa
+            self.sky_dia = sky.copyTo(self.camera)
+            self.sky_dia.setTexture(self.t_sky_dia, 1)
+            self.sky_dia.setBin("background", 0)
+            sky.setBin("background", 1)
+            sky.setTransparency(TransparencyAttrib.MAlpha)
+        self.update_dia(0.0)
+
+    def update_dia(self, t):
+        """Interpola luz, nevoa e ceu entre os momentos do dia (meio-dia -> por do sol -> noite)."""
+        f = max(0.0, min(1.0, t / CICLO))
+        for a, b in zip(DIA, DIA[1:]):
+            if f <= b[0]:
+                break
+        k = (f - a[0]) / max(1e-6, b[0] - a[0])
+        k = k * k * (3 - 2 * k)
+        mix = lambda u, v: tuple(x + (y - x) * k for x, y in zip(u, v))   # noqa: E731
+        amb, sol, hp, nev, m, tom = (mix(a[i], b[i]) if i != 5 else a[5] + (b[5] - a[5]) * k
+                                     for i in range(1, 7))
+        self.amb.setColor(Vec4(*amb, 1))
+        self.sun_light.setColor(Vec4(*sol, 1))
+        self.sun.setHpr(hp[0], hp[1], 0)
+        # o simplepbr so le a cor da nevoa quando o estado muda: troca o no se a cor mudou
+        if max(abs(x - y) for x, y in zip(nev, getattr(self, "fog_cor", (9, 9, 9)))) > 0.004:
+            self.fog_cor = nev
+            fog = Fog("nevoa")
+            fog.setColor(*nev)
+            fog.setExpDensity(0.0030)
+            self.fog = fog
+            self.render.setFog(fog)
+        self.setBackgroundColor(*nev, 1)
+        if self.sky_dia is not None:
+            self.sky_dia.setColorScale(*tom, 1)
+            self.sky.setColorScale(*tom, m)
+        else:
+            self.sky.setColorScale(*tom, 1)
 
     def build_ground(self):
         cm = CardMaker("grama")
@@ -418,10 +496,16 @@ class Jogo(ShowBase):
         """Personagem do Mixamo (FBX com esqueleto e animacao de captura de movimento)."""
         from direct.actor.Actor import Actor
         m = self.loader.loadModel(fn(path))
-        actor = Actor(m)
-        self.fig_anims = actor.getAnimNames()
-        ctrl = actor.getAnimControl(self.fig_anims[0])
-        self.fig_frames = ctrl.getNumFrames()
+        d = os.path.dirname(path)
+        anims = {"andar": fn(path)}
+        for nome, arq in (("espada", "heroi_espada.glb"), ("soco", "heroi_soco.glb")):
+            if os.path.basename(path).startswith("heroi_") and os.path.exists(os.path.join(d, arq)):
+                anims[nome] = fn(os.path.join(d, arq))
+        actor = Actor(m, anims)
+        self.hero_anims = {k: actor.getAnimControl(k).getNumFrames() for k in anims}
+        self.fig_anims = ["andar"]
+        self.fig_frames = self.hero_anims["andar"]
+        self.own_texture = os.path.basename(path).startswith("heroi_")
         pivot = self.render.attachNewNode("figura")
         holder = pivot.attachNewNode("corpo")
         actor.reparentTo(holder)
@@ -435,10 +519,128 @@ class Jogo(ShowBase):
         a, b = actor.getTightBounds()
         actor.setZ(-a.z)
         self.hips = actor.exposeJoint(None, "modelRoot", "mixamorig:Hips")
-        actor.setColorScale(0.72, 0.82, 1.15, 1)    # heroi prateado-azulado (inimigos sao vermelhos)
+        self.base_tint = (1.0, 1.0, 1.0) if self.own_texture else (0.72, 0.82, 1.15)
+        actor.setColorScale(*self.base_tint, 1)
         self.fig_actor, self.knight, self.knight_body = actor, pivot, holder
         self.boneco = None
         self.fig_root0 = None
+        # passada real da animacao (m/s), para os pes nao deslizarem
+        nf = self.fig_frames
+        actor.pose("andar", 0)
+        y0 = self.hips.getPos(holder)
+        actor.pose("andar", nf - 1)
+        y1 = self.hips.getPos(holder)
+        self.stride_speed = max(0.3, (y1 - y0).length() / ((nf - 1) / 30.0))
+        actor.pose("andar", 0)
+        # espada presa na mao direita (aparece quando o cavaleiro a pega)
+        self.hand = actor.exposeJoint(None, "modelRoot", "mixamorig:RightHand")
+        grip = self.hand.attachNewNode("pegada")
+        grip.setScale(self.render, 1.0)          # 1 unidade = 1 m dentro da pegada
+        self.hand_sword = self.make_sword()
+        self.hand_sword.reparentTo(grip)
+        self.hand_sword.setPosHpr(*SWORD_GRIP)
+        self.hand_sword.hide()
+
+    def make_sword(self):
+        """Espada longa simples: lamina, guarda, cabo e pomo (cabo na origem, lamina para +Z)."""
+        fmt = GeomVertexFormat.getV3n3c4()
+        vd = GeomVertexData("espada", fmt, Geom.UHStatic)
+        vw, nw, cw = (GeomVertexWriter(vd, c) for c in ("vertex", "normal", "color"))
+        tris = GeomTriangles(Geom.UHStatic)
+
+        def box(x0, x1, y0, y1, z0, z1, col, tip=False):
+            for nrm, quad in (((0, 0, 1), ((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))),
+                              ((0, 0, -1), ((x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0))),
+                              ((1, 0, 0), ((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))),
+                              ((-1, 0, 0), ((x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1))),
+                              ((0, 1, 0), ((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1))),
+                              ((0, -1, 0), ((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)))):
+                b = vw.getWriteRow()
+                for p in quad:
+                    if tip and p[2] == z1:
+                        p = ((x0 + x1) / 2, (y0 + y1) / 2, z1)
+                    vw.addData3(*p)
+                    nw.addData3(*nrm)
+                    cw.addData4(*col)
+                tris.addVertices(b, b + 1, b + 2)
+                tris.addVertices(b, b + 2, b + 3)
+
+        aco, ouro, couro = (0.82, 0.84, 0.88, 1), (0.78, 0.60, 0.25, 1), (0.25, 0.15, 0.09, 1)
+        box(-0.035, 0.035, -0.008, 0.008, 0.12, 0.95, aco)            # lamina
+        box(-0.035, 0.035, -0.008, 0.008, 0.95, 1.08, aco, tip=True)  # ponta
+        box(-0.15, 0.15, -0.025, 0.025, 0.09, 0.13, ouro)             # guarda
+        box(-0.02, 0.02, -0.02, 0.02, -0.10, 0.09, couro)             # cabo
+        box(-0.035, 0.035, -0.035, 0.035, -0.15, -0.10, ouro)         # pomo
+        g = Geom(vd)
+        g.addPrimitive(tris)
+        node = GeomNode("espada")
+        node.addGeom(g)
+        root = NodePath("espada_raiz")
+        np_ = root.attachNewNode(node)
+        from panda3d.core import Material
+        mat = Material("aco")
+        mat.setBaseColor((1, 1, 1, 1))
+        mat.setMetallic(0.85)
+        mat.setRoughness(0.3)
+        np_.setMaterial(mat, 1)
+        return root
+
+    def spawn_sword_item(self, y):
+        """Espada fincada/flutuando na estrada: pegar habilita o ataque com espada."""
+        it = self.render.attachNewNode("espada_item")
+        sw = self.make_sword()
+        sw.reparentTo(it)
+        sw.setZ(0.35)
+        glow = self.card(self.t_glow, 1.6, 1.6, it)
+        glow.setP(-90)
+        glow.setZ(0.04)
+        glow.setColorScale(0.45, 0.35, 0.12, 1)
+        glow.setTransparency(TransparencyAttrib.MAlpha)
+        from panda3d.core import ColorBlendAttrib
+        glow.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd))
+        glow.setDepthWrite(False)
+        glow.setLightOff(1)
+        glow.setShaderOff(1)
+        glow.setFogOff(1)
+        x = random.uniform(-ROAD_W + 1.0, ROAD_W - 1.0)
+        it.setPos(x, y, 0)
+        self.sword_item = dict(node=it, sw=sw, x=x, y=y)
+
+    def toggle_sword(self):
+        if self.has_sword and self.atk is None:
+            self.armed = not self.armed
+            if hasattr(self, "hand_sword"):
+                (self.hand_sword.show if self.armed else self.hand_sword.hide)()
+
+    def start_attack(self):
+        anim = "espada" if self.armed else "soco"
+        if anim not in getattr(self, "hero_anims", {}):
+            return False
+        self.atk = dict(anim=anim, t=0.0, dur=self.hero_anims[anim] / 30.0, hits=list(ATAQUES[anim][0]))
+        self.atk_prev_hips = None
+        # mira: vira para o inimigo mais proximo a frente (cone de ~100 graus, ate 4 m)
+        h = math.radians(getattr(self, "face_h", 0.0))
+        fx, fy = -math.sin(h), math.cos(h)
+        alvo = min(((math.hypot(e["x"] - self.px, e["y"] - self.py), e) for e in self.enemies
+                    if e["hp"] > 0 and e["z"] < 1.8 and 0.1 < math.hypot(e["x"] - self.px, e["y"] - self.py) < 4.0
+                    and ((e["x"] - self.px) * fx + (e["y"] - self.py) * fy) /
+                    math.hypot(e["x"] - self.px, e["y"] - self.py) > 0.64), default=None, key=lambda t: t[0])
+        if alvo:
+            e = alvo[1]
+            self.face_h = math.degrees(math.atan2(-(e["x"] - self.px), e["y"] - self.py))
+        return True
+
+    def melee_hit(self, alcance, dano):
+        h = math.radians(self.face_h)
+        fx, fy = -math.sin(h), math.cos(h)
+        for e in self.enemies:
+            ex, ey = e["x"] - self.px, e["y"] - self.py
+            d = math.hypot(ex, ey)
+            if e["hp"] > 0 and e["z"] < 1.8 and d < alcance + e["r"] and (d < 0.4 or (ex * fx + ey * fy) / d > 0.35):
+                e["hp"] -= dano
+                e["flash"] = 0.2
+                if e["hp"] <= 0:
+                    self.score += 100
 
     # ------------------------------------------------------------ cenario
     def card(self, tex, w, h, parent=None):
@@ -635,9 +837,17 @@ class Jogo(ShowBase):
             ix = (1 if (k.get("d") or k.get("arrow_right")) else 0) - (1 if (k.get("a") or k.get("arrow_left")) else 0)
             iy = (1 if (k.get("w") or k.get("arrow_up")) else 0) - (1 if (k.get("s") or k.get("arrow_down")) else 0)
             fire = k.get("space") or k.get("mouse1")
-        # movimento livre com as setas (velocidade suavizada)
+        melee = "soco" in getattr(self, "hero_anims", {})
+        if melee:
+            if fire and self.atk is None:
+                self.start_attack()
+            fire = False
+        # movimento livre com as setas (velocidade suavizada); parado durante o ataque
         n = math.hypot(ix, iy)
-        tx, ty = (ix / n * SPEED, iy / n * SPEED) if n > 0 else (0.0, 0.0)
+        vmax = HERO_SPEED if melee else SPEED
+        if self.atk is not None:
+            n = 0
+        tx, ty = (ix / n * vmax, iy / n * vmax) if n > 0 else (0.0, 0.0)
         self.pvx += (tx - self.pvx) * min(1, dt * 9)
         self.pvy = getattr(self, "pvy", 0.0)
         self.pvy += (ty - self.pvy) * min(1, dt * 9)
@@ -664,17 +874,41 @@ class Jogo(ShowBase):
         else:
             # animacao do Mixamo: avanca so quando anda; parado, volta a postura de pe
             self.fig_t = getattr(self, "fig_t", 0.0)
-            if self.moving:
-                self.fig_t += dt * (speed / 2.9)
-                frame = (self.fig_t * 30.0) % self.fig_frames
+            if self.atk is not None:
+                a = self.atk
+                a["t"] += dt
+                anim, frame = a["anim"], min(a["t"] * 30.0, self.hero_anims[a["anim"]] - 1)
+                while a["hits"] and a["t"] >= a["hits"][0] * a["dur"]:
+                    a["hits"].pop(0)
+                    self.melee_hit(ATAQUES[anim][1], ATAQUES[anim][2])
+                if a["t"] >= a["dur"]:
+                    self.atk = None
+            elif self.moving:
+                # ritmo da animacao = velocidade real / passada da animacao (pes sem deslizar)
+                self.fig_t += dt * (speed / getattr(self, "stride_speed", 2.9))
+                anim, frame = "andar", (self.fig_t * 30.0) % self.fig_frames
             else:
                 self.fig_t = 0.0
-                frame = 0
-            for an in self.fig_anims:
-                self.fig_actor.pose(an, frame)
+                anim, frame = "andar", 0
+            self.fig_actor.pose(anim, frame)
             hp = self.hips.getPos(self.knight_body)
             if self.fig_root0 is None:
                 self.fig_root0 = hp
+            if self.atk is not None and self.atk["anim"] == "espada":
+                # o salto do ataque com espada avanca o cavaleiro de verdade
+                # (o quadril foi recolocado em root0 no quadro anterior; o que passou disso e avanco)
+                if getattr(self, "atk_prev_hips", None) is not None:
+                    d = hp - self.fig_root0
+                    wd = self.render.getRelativeVector(self.knight_body, Vec3(d.x, d.y, 0))
+                    nx = max(-WALK_LIM, min(WALK_LIM, self.px + wd.x))
+                    ny = self.py + wd.y
+                    bloqueado = any(e["kind"] == "golpeador" and e["hp"] > 0 and
+                                    math.hypot(nx - e["x"], ny - e["y"]) < 0.9 and
+                                    math.hypot(nx - e["x"], ny - e["y"]) < math.hypot(self.px - e["x"], self.py - e["y"])
+                                    for e in self.enemies)
+                    if not bloqueado:                    # o salto para diante do inimigo
+                        self.px, self.py = nx, ny
+                self.atk_prev_hips = hp
             self.fig_actor.setX(self.fig_actor.getX() - (hp.x - self.fig_root0.x))
             self.fig_actor.setY(self.fig_actor.getY() - (hp.y - self.fig_root0.y))
             self.knight.setPos(self.px, self.py, 0)
@@ -685,8 +919,9 @@ class Jogo(ShowBase):
         self.cam_x += (self.px * 0.7 - self.cam_x) * min(1, dt * 4)
         self.cam_y += (self.py - self.cam_y) * min(1, dt * 4)
         self.camera.setPos(self.cam_x, self.cam_y - CAM_BACK, CAM_UP)
-        self.camera.lookAt(self.cam_x + (self.px - self.cam_x) * 0.3, self.cam_y + 8, 0.6)
+        self.camera.lookAt(self.cam_x + (self.px - self.cam_x) * 0.3, self.cam_y + 8, CAM_ALVO_Z)
         self.sun.setPos(self.px, self.py + 8, 0)
+        self.update_dia(self.t)
         self.grass.setY(math.floor(self.py / 5.0) * 5.0)
         self.road.setY(math.floor(self.py / self.road_len) * self.road_len)
         self.update_scenery()
@@ -756,8 +991,34 @@ class Jogo(ShowBase):
         self.hit_flash = max(0.0, getattr(self, "hit_flash", 0.0) - dt)
         if self.figura is None and hasattr(self, "fig_actor"):
             f = self.hit_flash / 0.25
-            self.fig_actor.setColorScale(0.80 + 0.9 * f, 0.88 - 0.5 * f, 1.10 - 0.6 * f, 1)
-        self.hud.setText("PONTOS %06d     VIDA %s" % (self.score, "#" * self.hp))
+            r, g, b = self.base_tint
+            self.fig_actor.setColorScale(r + 0.9 * f, g - 0.5 * f, b - 0.6 * f, 1)
+        for e in self.enemies:                                   # inimigo atingido pisca
+            if e.get("flash", 0) > 0 and "actor" in e:
+                e["flash"] -= dt
+                e["actor"].setColorScale((2.0, 1.6, 1.4, 1) if e["flash"] > 0 else (1.0, 0.55, 0.5, 1))
+        # espada na estrada: pegar habilita o ataque com espada (Q/Tab alterna com o soco)
+        if "espada" in getattr(self, "hero_anims", {}) and not self.has_sword:
+            if self.sword_item is None and self.py + 30 > self.next_sword_y:
+                self.spawn_sword_item(self.next_sword_y)
+            it = self.sword_item
+            if it is not None:
+                it["sw"].setH(self.t * 90)
+                it["sw"].setZ(0.35 + math.sin(self.t * 3) * 0.08)
+                if math.hypot(it["x"] - self.px, it["y"] - self.py) < 1.0:
+                    self.has_sword = True
+                    it["node"].removeNode()
+                    self.sword_item = None
+                    if self.atk is None:
+                        self.armed = False
+                        self.toggle_sword()
+                elif self.py - it["y"] > 6:                     # passou direto: ela reaparece adiante
+                    it["node"].removeNode()
+                    self.sword_item = None
+                    self.next_sword_y = self.py + 25
+        arma = ("ESPADA" if self.armed else "PUNHOS") if "soco" in getattr(self, "hero_anims", {}) else ""
+        dica = "   (Q troca)" if self.has_sword else ""
+        self.hud.setText("PONTOS %06d     VIDA %s     %s%s" % (self.score, "#" * self.hp, arma, dica))
         return task.cont
 
 

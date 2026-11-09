@@ -17,6 +17,69 @@ import numpy as np
 COMP = {5121: np.uint8, 5123: np.uint16, 5125: np.uint32}
 
 
+def _ler(j, binbuf, acc_id):
+    acc = j["accessors"][acc_id]
+    bv = j["bufferViews"][acc["bufferView"]]
+    dt = {5121: np.uint8, 5123: np.uint16, 5125: np.uint32, 5126: np.float32}[acc["componentType"]]
+    isz = np.dtype(dt).itemsize
+    stride = bv.get("byteStride", 4 * isz)
+    start = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    raw = np.frombuffer(bytes(binbuf), np.uint8)
+    idx = start + np.arange(acc["count"])[:, None] * stride + np.arange(4 * isz)[None, :]
+    a = raw[idx].copy().view(dt).reshape(acc["count"], 4)
+    if acc.get("normalized") and dt != np.float32:
+        a = a.astype(np.float32) / np.iinfo(dt).max
+    return a
+
+
+def pesos_4(j, binbuf):
+    """O Mixamo exporta ate 8 ossos por vertice (JOINTS_1/WEIGHTS_1) e o panda3d-gltf perde
+    esses pesos (a malha fica parada). Mantem os 4 mais fortes, renormalizados, em JOINTS_0."""
+    feitos = {}
+    for mesh in j["meshes"]:
+        for prim in mesh["primitives"]:
+            at = prim["attributes"]
+            if "JOINTS_1" not in at or "WEIGHTS_1" not in at:
+                continue
+            chave = (at["JOINTS_0"], at["WEIGHTS_0"], at["JOINTS_1"], at["WEIGHTS_1"])
+            if chave not in feitos:
+                J = np.concatenate([_ler(j, binbuf, at["JOINTS_0"]), _ler(j, binbuf, at["JOINTS_1"])], 1)
+                W = np.concatenate([_ler(j, binbuf, at["WEIGHTS_0"]), _ler(j, binbuf, at["WEIGHTS_1"])], 1)
+                o = np.argsort(-W, axis=1)[:, :4]
+                J4 = np.take_along_axis(J, o, 1).astype(np.uint16)
+                W4 = np.take_along_axis(W, o, 1).astype(np.float32)
+                W4 /= np.maximum(W4.sum(1, keepdims=True), 1e-8)
+                # o panda3d-gltf indexa cada combinacao osso/peso em 16 bits (max 65535):
+                # quantiza os pesos para caber, aumentando o passo se precisar
+                for q in (24, 16, 12, 8):
+                    Wq = np.round(W4 * q)
+                    Wq[:, 0] = np.maximum(Wq[:, 0], 1)
+                    Wq /= Wq.sum(1, keepdims=True)
+                    Jq = np.where(Wq > 0, J4, 0)
+                    combos = len(np.unique(np.concatenate([Jq.astype(np.float32), Wq], 1), axis=0))
+                    if combos < 60000:
+                        break
+                print("  combinacoes de pesos: %d (passo 1/%d)" % (combos, q))
+                W4, J4 = Wq.astype(np.float32), Jq.astype(np.uint16)
+                ids = []
+                for arr, comp, nome in ((J4, 5123, "j"), (W4, 5126, "w")):
+                    binbuf += b"\0" * ((4 - len(binbuf) % 4) % 4)
+                    off = len(binbuf)
+                    binbuf += arr.tobytes()
+                    j["bufferViews"].append({"buffer": 0, "byteOffset": off, "byteLength": arr.nbytes})
+                    acc = {"bufferView": len(j["bufferViews"]) - 1, "componentType": comp,
+                           "count": len(arr), "type": "VEC4"}
+                    j["accessors"].append(acc)
+                    ids.append(len(j["accessors"]) - 1)
+                feitos[chave] = ids
+            at["JOINTS_0"], at["WEIGHTS_0"] = feitos[chave]
+            del at["JOINTS_1"], at["WEIGHTS_1"]
+    if feitos:
+        j["buffers"][0]["byteLength"] = len(binbuf) + (4 - len(binbuf) % 4) % 4
+        print("pesos reduzidos a 4 ossos por vertice")
+    return binbuf
+
+
 def main(src, dst):
     d = open(src, "rb").read()
     L = struct.unpack("<I", d[12:16])[0]
@@ -64,6 +127,7 @@ def main(src, dst):
             if "skin" in n:
                 n["skin"] = new_index[n["skin"]]
     j["animations"] = [a for a in j.get("animations", []) if a.get("channels")]
+    binbuf = pesos_4(j, binbuf)
 
     js = json.dumps(j, separators=(",", ":")).encode()
     js += b" " * ((4 - len(js) % 4) % 4)
